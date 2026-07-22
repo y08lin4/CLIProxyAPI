@@ -1073,9 +1073,20 @@ func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 	if req == nil {
 		return nil
 	}
-	apiKey, _ := codexCreds(auth)
-	if strings.TrimSpace(apiKey) != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
+	ctx := req.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	authorization, accountID, fedramp, err := resolveCodexAuthorization(ctx, e.cfg, auth)
+	if err != nil {
+		return err
+	}
+	setCodexAuthorizationHeader(req.Header, authorization)
+	if accountID != "" {
+		req.Header.Set("Chatgpt-Account-Id", accountID)
+	}
+	if fedramp {
+		req.Header.Set("X-OpenAI-Fedramp", "true")
 	}
 	var attrs map[string]string
 	if auth != nil {
@@ -1110,9 +1121,13 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
-	apiKey, baseURL := codexCreds(auth)
+	_, baseURL := codexCreds(auth)
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
+	}
+	authorization, _, _, errAuth := resolveCodexAuthorization(ctx, e.cfg, auth)
+	if errAuth != nil {
+		return resp, errAuth
 	}
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
@@ -1160,7 +1175,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if err != nil {
 		return resp, err
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	applyCodexHeaders(httpReq, auth, authorization, true, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
@@ -1201,6 +1216,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		invalidateCodexAgentTaskIfAuthError(auth, httpResp.StatusCode)
 		err = newCodexStatusErr(httpResp.StatusCode, b)
 		return resp, err
 	}
@@ -1276,9 +1292,13 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
-	apiKey, baseURL := codexCreds(auth)
+	_, baseURL := codexCreds(auth)
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
+	}
+	authorization, _, _, errAuth := resolveCodexAuthorization(ctx, e.cfg, auth)
+	if errAuth != nil {
+		return resp, errAuth
 	}
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
@@ -1315,7 +1335,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
+	applyCodexHeaders(httpReq, auth, authorization, false, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
@@ -1353,6 +1373,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		b = applyCodexIdentityConfuseResponsePayload(b, identityState)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		invalidateCodexAgentTaskIfAuthError(auth, httpResp.StatusCode)
 		err = newCodexStatusErr(httpResp.StatusCode, b)
 		return resp, err
 	}
@@ -1381,9 +1402,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
-	apiKey, baseURL := codexCreds(auth)
+	_, baseURL := codexCreds(auth)
 	if baseURL == "" {
 		baseURL = "https://chatgpt.com/backend-api/codex"
+	}
+	authorization, _, _, errAuth := resolveCodexAuthorization(ctx, e.cfg, auth)
+	if errAuth != nil {
+		return nil, errAuth
 	}
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
@@ -1430,7 +1455,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, err
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+	applyCodexHeaders(httpReq, auth, authorization, true, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
 	var authID, authLabel, authType, authValue string
@@ -1474,6 +1499,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		invalidateCodexAgentTaskIfAuthError(auth, httpResp.StatusCode)
 		err = newCodexStatusErr(httpResp.StatusCode, data)
 		return nil, err
 	}
@@ -1724,6 +1750,10 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 
 func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	log.Debugf("codex executor: refresh called")
+	// Agent identity credentials do not use OAuth refresh tokens.
+	if isCodexAgentIdentityAuth(auth) {
+		return auth, nil
+	}
 	if refreshed, handled, err := helps.RefreshAuthViaHome(ctx, e.cfg, auth); handled {
 		return refreshed, err
 	}
@@ -1985,7 +2015,14 @@ func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, toke
 
 func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, ginHeaders http.Header) {
 	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Authorization", "Bearer "+token)
+	// token may be a bare OAuth/API key token or a full Authorization value
+	// ("Bearer …" / "AgentAssertion …").
+	if authz := normalizeCodexAuthorization(token); authz != "" {
+		r.Header.Set("Authorization", authz)
+	} else {
+		// Preserve historical behavior for empty tokens in non-agent paths.
+		r.Header.Set("Authorization", "Bearer ")
+	}
 
 	if ginHeaders != nil && ginHeaders.Get("X-Codex-Beta-Features") != "" {
 		r.Header.Set("X-Codex-Beta-Features", ginHeaders.Get("X-Codex-Beta-Features"))
@@ -2019,11 +2056,12 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 		r.Header.Set("Originator", codexOriginator)
 	}
 	if !isAPIKey {
-		if auth != nil && auth.Metadata != nil {
-			if accountID, ok := auth.Metadata["account_id"].(string); ok {
-				r.Header.Set("Chatgpt-Account-Id", accountID)
-			}
+		if accountID := codexAccountIDFromAuth(auth); accountID != "" {
+			r.Header.Set("Chatgpt-Account-Id", accountID)
 		}
+	}
+	if isCodexAgentIdentityAuth(auth) && codexAccountIsFedRAMP(auth) {
+		r.Header.Set("X-OpenAI-Fedramp", "true")
 	}
 	var attrs map[string]string
 	if auth != nil {
@@ -2297,6 +2335,140 @@ func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 		}
 	}
 	return
+}
+
+func isCodexAgentIdentityAuth(auth *cliproxyauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	return codexauth.IsAgentIdentityMetadata(auth.Metadata)
+}
+
+func codexAccountIDFromAuth(auth *cliproxyauth.Auth) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	if v, ok := auth.Metadata["account_id"].(string); ok {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			return trimmed
+		}
+	}
+	if v, ok := auth.Metadata["chatgpt_account_id"].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+func codexAccountIsFedRAMP(auth *cliproxyauth.Auth) bool {
+	if auth == nil || auth.Metadata == nil {
+		return false
+	}
+	switch v := auth.Metadata["chatgpt_account_is_fedramp"].(type) {
+	case bool:
+		return v
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "y":
+			return true
+		}
+	case float64:
+		return v != 0
+	case int:
+		return v != 0
+	}
+	return false
+}
+
+// normalizeCodexAuthorization accepts either a bare token or a full Authorization
+// header value and returns a complete Authorization header value.
+func normalizeCodexAuthorization(token string) string {
+	authz := strings.TrimSpace(token)
+	if authz == "" {
+		return ""
+	}
+	if strings.HasPrefix(authz, "Bearer ") || strings.HasPrefix(authz, "AgentAssertion ") {
+		return authz
+	}
+	// Case-insensitive Bearer for robustness.
+	if len(authz) >= 7 && strings.EqualFold(authz[:7], "bearer ") {
+		return "Bearer " + strings.TrimSpace(authz[7:])
+	}
+	return "Bearer " + authz
+}
+
+func setCodexAuthorizationHeader(h http.Header, authorization string) {
+	if h == nil {
+		return
+	}
+	if authz := normalizeCodexAuthorization(authorization); authz != "" {
+		h.Set("Authorization", authz)
+	}
+}
+
+// resolveCodexAuthorization returns the full Authorization header value for the
+// given auth (Bearer for OAuth/API key, AgentAssertion for agent identity).
+// Also returns account ID and FedRAMP flag for agent identity / OAuth metadata.
+func resolveCodexAuthorization(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) (authorization, accountID string, fedramp bool, err error) {
+	accountID = codexAccountIDFromAuth(auth)
+	fedramp = codexAccountIsFedRAMP(auth)
+
+	if isCodexAgentIdentityAuth(auth) {
+		rec, errRec := codexauth.AgentIdentityFromMetadata(auth.Metadata)
+		if errRec != nil {
+			return "", accountID, fedramp, fmt.Errorf("codex agent identity: %w", errRec)
+		}
+		if accountID == "" {
+			accountID = rec.AccountID
+		}
+		if !fedramp {
+			fedramp = rec.ChatGPTAccountIsFedRAMP
+		}
+		authID := ""
+		if auth != nil {
+			authID = auth.ID
+		}
+		cacheKey := codexauth.AgentTaskCacheKey(authID, rec.AgentRuntimeID)
+		// Task registration is credential acquisition — proxy-aware client is fine;
+		// RegisterAgentTask applies its own request timeout.
+		client := helps.NewProxyAwareHTTPClient(ctx, cfg, auth, 0)
+		taskID, errTask := codexauth.EnsureAgentTaskID(ctx, client, cacheKey, rec)
+		if errTask != nil {
+			return "", accountID, fedramp, errTask
+		}
+		header, errHeader := codexauth.AuthorizationHeaderForAgentTask(rec, taskID)
+		if errHeader != nil {
+			return "", accountID, fedramp, errHeader
+		}
+		return header, accountID, fedramp, nil
+	}
+
+	apiKey, _ := codexCreds(auth)
+	if strings.TrimSpace(apiKey) == "" {
+		return "", accountID, fedramp, nil
+	}
+	return "Bearer " + apiKey, accountID, fedramp, nil
+}
+
+// invalidateCodexAgentTaskIfAuthError drops the process-local task id on 401/403
+// so the next request re-registers.
+func invalidateCodexAgentTaskIfAuthError(auth *cliproxyauth.Auth, statusCode int) {
+	if statusCode != http.StatusUnauthorized && statusCode != http.StatusForbidden {
+		return
+	}
+	if !isCodexAgentIdentityAuth(auth) {
+		return
+	}
+	authID := ""
+	runtimeID := ""
+	if auth != nil {
+		authID = auth.ID
+		if auth.Metadata != nil {
+			if v, ok := auth.Metadata["agent_runtime_id"].(string); ok {
+				runtimeID = v
+			}
+		}
+	}
+	codexauth.InvalidateAgentTaskIDForAuth(authID, runtimeID)
 }
 
 func (e *CodexExecutor) resolveCodexConfig(auth *cliproxyauth.Auth) *config.CodexKey {

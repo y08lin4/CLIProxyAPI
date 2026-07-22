@@ -207,9 +207,20 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	coreauth.ApplyCustomHeadersFromMetadata(a)
 	coreauth.SetOAuthModelAliasesAttribute(a, perAccountModelAliases)
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
-	// For codex auth files, extract plan_type from the JWT id_token.
+	// For codex auth files: normalize agent identity metadata and extract plan_type.
 	if provider == "codex" {
-		if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
+		if codex.IsAgentIdentityMetadata(metadata) {
+			if normalized, errNorm := codex.NormalizeAgentIdentityMetadata(metadata); errNorm == nil && normalized != nil {
+				metadata = normalized
+				a.Metadata = metadata
+			}
+			if pt, _ := metadata["plan_type"].(string); strings.TrimSpace(pt) != "" {
+				a.Attributes["plan_type"] = strings.TrimSpace(pt)
+			}
+			if email, _ := metadata["email"].(string); strings.TrimSpace(email) != "" {
+				a.Label = strings.TrimSpace(email)
+			}
+		} else if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
 			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
 				if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
 					a.Attributes["plan_type"] = pt

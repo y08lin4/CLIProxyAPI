@@ -31,6 +31,30 @@ func CredentialFileName(email, planType, hashAccountID string, includeProviderPr
 	return fmt.Sprintf("%s-%s-%s.json", prefix, email, plan)
 }
 
+// AgentCredentialFileName returns the filename used to persist Codex Agent Identity credentials.
+// Uses a codex-agent- prefix so files do not collide with OAuth credential files.
+func AgentCredentialFileName(email, planType, hashAccountID string) string {
+	email = strings.TrimSpace(email)
+	plan := normalizePlanTypeForFilename(planType)
+	hashAccountID = strings.TrimSpace(hashAccountID)
+
+	const prefix = "codex-agent"
+	if email == "" {
+		email = "unknown"
+	}
+
+	if hashAccountID != "" {
+		if plan == "" {
+			return fmt.Sprintf("%s-%s-%s.json", prefix, hashAccountID, email)
+		}
+		return fmt.Sprintf("%s-%s-%s-%s.json", prefix, hashAccountID, email, plan)
+	}
+	if plan == "" {
+		return fmt.Sprintf("%s-%s.json", prefix, email)
+	}
+	return fmt.Sprintf("%s-%s-%s.json", prefix, email, plan)
+}
+
 func normalizePlanTypeForFilename(planType string) string {
 	planType = strings.TrimSpace(planType)
 	if planType == "" {

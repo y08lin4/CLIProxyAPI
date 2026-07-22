@@ -1020,6 +1020,12 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 			dst = abs
 		}
 	}
+	// Normalize Codex Agent Identity credentials to the canonical flat shape on disk.
+	if normalized, ok, errNorm := normalizeCodexAgentIdentityAuthData(data); errNorm != nil {
+		return errNorm
+	} else if ok {
+		data = normalized
+	}
 	auth, err := h.buildAuthFromFileData(dst, data)
 	if err != nil {
 		return err
@@ -1031,6 +1037,166 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 		return err
 	}
 	return nil
+}
+
+// normalizeCodexAgentIdentityAuthData rewrites nested/JWT agent identity payloads to CPA flat form.
+// Returns ok=false when the payload is not agent identity metadata.
+func normalizeCodexAgentIdentityAuthData(data []byte) ([]byte, bool, error) {
+	if len(data) == 0 {
+		return nil, false, nil
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return nil, false, nil
+	}
+	if !codex.IsAgentIdentityMetadata(metadata) {
+		return nil, false, nil
+	}
+	normalized, err := codex.NormalizeAgentIdentityMetadata(metadata)
+	if err != nil {
+		return nil, false, fmt.Errorf("invalid codex agent identity auth file: %w", err)
+	}
+	out, err := json.MarshalIndent(normalized, "", "  ")
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to marshal normalized agent identity: %w", err)
+	}
+	return out, true, nil
+}
+
+// BootstrapCodexAgentIdentity registers a Codex Agent Identity runtime from a ChatGPT session
+// access_token, persists the canonical flat auth file (without returning the private key),
+// and upserts it into the auth manager.
+//
+// POST /v0/management/codex-agent-identity
+// Body: { "access_token": "...", "id_token"?: "...", "email"?: "...", "account_id"?: "...", "chatgpt_account_is_fedramp"?: bool }
+func (h *Handler) BootstrapCodexAgentIdentity(c *gin.Context) {
+	if h == nil || h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "handler unavailable"})
+		return
+	}
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req struct {
+		AccessToken             string `json:"access_token"`
+		IDToken                 string `json:"id_token"`
+		Email                   string `json:"email"`
+		AccountID               string `json:"account_id"`
+		ChatGPTAccountIsFedRAMP *bool  `json:"chatgpt_account_is_fedramp"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	accessToken := strings.TrimSpace(req.AccessToken)
+	if accessToken == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "access_token is required"})
+		return
+	}
+
+	// Prefer id_token claims when provided; fall back to access_token payload.
+	var claims *codex.JWTClaims
+	if idToken := strings.TrimSpace(req.IDToken); idToken != "" {
+		if parsed, errParse := codex.ParseJWTToken(idToken); errParse == nil {
+			claims = parsed
+		}
+	}
+	if claims == nil {
+		if parsed, errParse := codex.ParseJWTToken(accessToken); errParse == nil {
+			claims = parsed
+		}
+	}
+
+	email := strings.TrimSpace(req.Email)
+	accountID := strings.TrimSpace(req.AccountID)
+	planType := ""
+	chatgptUserID := ""
+	isFedRAMP := false
+	if claims != nil {
+		if email == "" {
+			email = strings.TrimSpace(claims.GetUserEmail())
+		}
+		if accountID == "" {
+			accountID = strings.TrimSpace(claims.GetAccountID())
+		}
+		planType = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
+		chatgptUserID = strings.TrimSpace(claims.CodexAuthInfo.ChatgptUserID)
+		if chatgptUserID == "" {
+			chatgptUserID = strings.TrimSpace(claims.CodexAuthInfo.UserID)
+		}
+	}
+	if req.ChatGPTAccountIsFedRAMP != nil {
+		isFedRAMP = *req.ChatGPTAccountIsFedRAMP
+	}
+
+	km, errKM := codex.GenerateAgentKeyMaterial()
+	if errKM != nil {
+		log.WithError(errKM).Error("codex agent identity: keygen failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate agent key material"})
+		return
+	}
+
+	client := util.SetProxy(&h.cfg.SDKConfig, &http.Client{})
+	ctx := c.Request.Context()
+	runtimeID, errReg := codex.RegisterAgentIdentity(
+		ctx,
+		client,
+		codex.ProdAgentIdentityAuthAPIBaseURL(),
+		accessToken,
+		isFedRAMP,
+		km,
+		codex.DefaultAgentBillOfMaterials(),
+		nil,
+	)
+	if errReg != nil {
+		log.WithError(errReg).Error("codex agent identity: register failed")
+		c.JSON(http.StatusBadGateway, gin.H{"error": errReg.Error()})
+		return
+	}
+
+	rec := &codex.AgentIdentityRecord{
+		AgentRuntimeID:          runtimeID,
+		PrivateKeyPKCS8Base64:   km.PrivateKeyPKCS8Base64,
+		AccountID:               accountID,
+		ChatGPTUserID:           chatgptUserID,
+		Email:                   email,
+		PlanType:                planType,
+		ChatGPTAccountIsFedRAMP: isFedRAMP,
+	}
+	meta := codex.BuildFlatAgentIdentityMetadata(rec)
+	if meta == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build agent identity metadata"})
+		return
+	}
+	data, errMarshal := json.MarshalIndent(meta, "", "  ")
+	if errMarshal != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to marshal agent identity metadata"})
+		return
+	}
+
+	hashAccountID := ""
+	if accountID != "" {
+		digest := sha256.Sum256([]byte(accountID))
+		hashAccountID = hex.EncodeToString(digest[:])[:8]
+	}
+	fileName := codex.AgentCredentialFileName(email, planType, hashAccountID)
+	if errWrite := h.writeAuthFile(ctx, fileName, data); errWrite != nil {
+		log.WithError(errWrite).Error("codex agent identity: write auth file failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errWrite.Error()})
+		return
+	}
+
+	// Never return agent_private_key to the client.
+	c.JSON(http.StatusOK, gin.H{
+		"status":           "ok",
+		"file":             fileName,
+		"agent_runtime_id": runtimeID,
+		"email":            email,
+		"account_id":       accountID,
+		"plan_type":        planType,
+	})
 }
 
 func requestedAuthFileNamesForDelete(c *gin.Context) ([]string, error) {
